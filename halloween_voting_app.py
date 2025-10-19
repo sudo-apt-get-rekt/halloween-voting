@@ -771,6 +771,11 @@ TPL_VOTE_NAME = r"""
   </div>
 </div>
 
+<!-- Instructions box: edit this text as you like -->
+<div class="notice-box" style="margin:12px 0 18px 0; padding:12px 14px; background:#1b1e25; border:1px solid #2b2f3a; border-radius:12px;">
+  <strong>Instructions:</strong> Enter your name to begin. On the next pages, pick one costume per category and then select 'Next'. You can go back to change selections before submitting.
+</div>
+
 <style>
   .form-name-grid{display:grid; grid-template-columns:1fr; gap:16px;}
   @media (min-width:720px){ .form-name-grid{ grid-template-columns:1fr 1fr; } }
