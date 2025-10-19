@@ -6,7 +6,7 @@ Self-hostable, lightweight, no external DB required.
 Features
 - Attendee entry: first name, last name, costume name, optional photo upload
 - Admin dashboard: view/delete entries, enable/disable voting, manage categories (add/rename/delete)
-- Voting form (when enabled): voter name + 1 pick per category
+- Voting wizard (when enabled): voter name + one category per screen with Back/Next/Finish
 - Results tally (admin-only)
 - Duplicate-vote protection by unique voter full name (case-insensitive)
 - One-click purge: wipe all data and reseed defaults
@@ -61,14 +61,12 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
 # -------------------------- DB UTILITIES ---------------------------
 
-
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     # enable cascades for safety
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
-
 
 def init_db():
     conn = get_db()
@@ -151,23 +149,18 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 @app.before_request
 def ensure_db():
     init_db()
 
-
 # ---------------------------- HELPERS ------------------------------
-
 
 def is_admin() -> bool:
     return session.get("admin", False) is True
 
-
 def require_admin():
     if not is_admin():
         abort(403)
-
 
 def allowed_file(filename: str) -> bool:
     if "." not in filename:
@@ -175,14 +168,12 @@ def allowed_file(filename: str) -> bool:
     ext = filename.rsplit(".", 1)[1].lower()
     return ext in ALLOWED_EXTS
 
-
 def get_setting(key: str, default: str = "") -> str:
     conn = get_db()
     cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
     row = cur.fetchone()
     conn.close()
     return row["value"] if row else default
-
 
 def set_setting(key: str, value: str) -> None:
     conn = get_db()
@@ -193,9 +184,21 @@ def set_setting(key: str, value: str) -> None:
     conn.commit()
     conn.close()
 
+def _enabled_categories():
+    conn = get_db()
+    rows = conn.execute("SELECT id, name FROM categories WHERE enabled=1 ORDER BY name").fetchall()
+    conn.close()
+    return rows
+
+def _all_entries():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, first_name, last_name, costume_name, photo_path FROM entries ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return rows
 
 # ------------------------------ ROUTES -----------------------------
-
 
 @app.get("/")
 def home():
@@ -211,7 +214,6 @@ def home():
         },
     )
 
-
 # --- Entries ---
 @app.get("/entry")
 def entry_form():
@@ -222,7 +224,6 @@ def entry_form():
             "content": render_template_string(TPL_ENTRY_FORM),
         },
     )
-
 
 @app.post("/entry")
 def entry_submit():
@@ -256,15 +257,27 @@ def entry_submit():
     flash("Costume submitted!", "success")
     return redirect(url_for("home"))
 
-
 @app.get("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
-
-# --- Voting ---
+# --- Voting (Wizard) ---
 @app.get("/vote")
 def vote_form():
+    """Redirect into the wizard if voting is enabled; otherwise show 'closed'."""
+    if get_setting("voting_enabled", "0") != "1":
+        return render_template_string(
+            TPL_BASE,
+            **{
+                "page_title": "Voting Closed",
+                "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
+            },
+        )
+    # start at first category
+    return redirect(url_for("vote_step", idx=0))
+
+@app.get("/vote/step/<int:idx>")
+def vote_step(idx: int):
     if get_setting("voting_enabled", "0") != "1":
         return render_template_string(
             TPL_BASE,
@@ -274,38 +287,92 @@ def vote_form():
             },
         )
 
-    conn = get_db()
-    cats = conn.execute(
-        "SELECT id, name FROM categories WHERE enabled=1 ORDER BY name"
-    ).fetchall()
-    entries = conn.execute(
-        "SELECT id, first_name, last_name, costume_name, photo_path FROM entries ORDER BY created_at DESC"
-    ).fetchall()
-    conn.close()
+    cats = _enabled_categories()
+    if not cats:
+        return render_template_string(
+            TPL_BASE,
+            **{
+                "page_title": "Cast Your Votes",
+                "content": "<p class='muted'>No categories are enabled.</p>",
+            },
+        )
+    if idx < 0 or idx >= len(cats):
+        return redirect(url_for("vote_step", idx=0))
+
+    entries = _all_entries()
+    ballot = session.get("ballot", {})  # {category_id(str): entry_id}
+    voter_first = session.get("voter_first", "")
+    voter_last = session.get("voter_last", "")
+
     return render_template_string(
         TPL_BASE,
         **{
             "page_title": "Cast Your Votes",
             "content": render_template_string(
-                TPL_VOTE_FORM, categories=cats, entries=entries
+                TPL_VOTE_WIZARD,
+                categories=cats,
+                category=cats[idx],
+                entries=entries,
+                idx=idx,
+                ballot=ballot,
+                voter_first=voter_first,
+                voter_last=voter_last,
             ),
         },
     )
 
-
-@app.post("/vote")
-def vote_submit():
+@app.post("/vote/step/<int:idx>")
+def vote_step_post(idx: int):
     if get_setting("voting_enabled", "0") != "1":
         abort(403)
 
-    voter_first = request.form.get("voter_first", "").strip()
-    voter_last = request.form.get("voter_last", "").strip()
-    if not (voter_first and voter_last):
-        flash("Please enter your first and last name.", "error")
-        return redirect(url_for("vote_form"))
+    # Update voter name on first step
+    if idx == 0:
+        vf = request.form.get("voter_first", "").strip()
+        vl = request.form.get("voter_last", "").strip()
+        if not vf or not vl:
+            flash("Please enter your first and last name.", "error")
+            return redirect(url_for("vote_step", idx=idx))
+        session["voter_first"] = vf
+        session["voter_last"] = vl
+
+    cats = _enabled_categories()
+    if not cats:
+        flash("No categories are enabled.", "error")
+        return redirect(url_for("home"))
+    if idx < 0 or idx >= len(cats):
+        return redirect(url_for("vote_step", idx=0))
+
+    current_cat = cats[idx]
+    choice = request.form.get("choice_entry_id")
+    ballot = session.get("ballot", {})
+    if choice:
+        try:
+            ballot[str(current_cat["id"])] = int(choice)
+        except ValueError:
+            pass
+        session["ballot"] = ballot
+
+    nav = request.form.get("nav", "next")
+    if nav == "prev":
+        return redirect(url_for("vote_step", idx=max(0, idx - 1)))
+    elif nav == "next":
+        return redirect(url_for("vote_step", idx=min(len(cats) - 1, idx + 1)))
+    else:  # finish
+        return redirect(url_for("vote_finish"))
+
+@app.get("/vote/finish")
+def vote_finish():
+    if get_setting("voting_enabled", "0") != "1":
+        abort(403)
+
+    voter_first = session.get("voter_first", "").strip()
+    voter_last = session.get("voter_last", "").strip()
+    if not voter_first or not voter_last:
+        flash("Missing voter name; please start again.", "error")
+        return redirect(url_for("vote_step", idx=0))
 
     conn = get_db()
-
     existing = conn.execute(
         "SELECT id FROM votes WHERE LOWER(voter_first)=LOWER(?) AND LOWER(voter_last)=LOWER(?)",
         (voter_first, voter_last),
@@ -313,7 +380,7 @@ def vote_submit():
     if existing:
         conn.close()
         flash("Our records show you've already submitted a ballot.", "error")
-        return redirect(url_for("vote_form"))
+        return redirect(url_for("home"))
 
     cur = conn.cursor()
     cur.execute(
@@ -322,10 +389,11 @@ def vote_submit():
     )
     vote_id = cur.lastrowid
 
-    cats = conn.execute("SELECT id FROM categories WHERE enabled=1").fetchall()
+    cats = _enabled_categories()
+    ballot = session.get("ballot", {})
     for c in cats:
-        field = f"cat_{c['id']}"
-        entry_id = request.form.get(field)
+        key = str(c["id"])
+        entry_id = ballot.get(key)
         if entry_id:
             try:
                 cur.execute(
@@ -338,9 +406,12 @@ def vote_submit():
     conn.commit()
     conn.close()
 
+    # Clear session ballot
+    for k in ("voter_first", "voter_last", "ballot"):
+        session.pop(k, None)
+
     flash("Thanks! Your ballot has been recorded.", "success")
     return redirect(url_for("home"))
-
 
 # --- Admin ---
 @app.get("/admin")
@@ -377,7 +448,6 @@ def admin():
         },
     )
 
-
 @app.post("/admin/login")
 def admin_login():
     pwd = request.form.get("password", "")
@@ -388,13 +458,11 @@ def admin_login():
     flash("Invalid password.", "error")
     return redirect(url_for("admin"))
 
-
 @app.post("/admin/logout")
 def admin_logout():
     session.clear()
     flash("Logged out.", "success")
     return redirect(url_for("home"))
-
 
 @app.post("/admin/toggle_voting")
 def toggle_voting():
@@ -404,7 +472,6 @@ def toggle_voting():
     set_setting("voting_enabled", new_val)
     flash(f"Voting {'enabled' if new_val=='1' else 'disabled'}.", "success")
     return redirect(url_for("admin"))
-
 
 @app.post("/admin/category/add")
 def category_add():
@@ -424,7 +491,6 @@ def category_add():
         conn.close()
     return redirect(url_for("admin"))
 
-
 @app.post("/admin/category/toggle/<int:cat_id>")
 def category_toggle(cat_id: int):
     require_admin()
@@ -441,7 +507,6 @@ def category_toggle(cat_id: int):
     conn.close()
     flash("Category updated.", "success")
     return redirect(url_for("admin"))
-
 
 @app.post("/admin/category/rename/<int:cat_id>")
 def category_rename(cat_id: int):
@@ -460,7 +525,6 @@ def category_rename(cat_id: int):
     finally:
         conn.close()
     return redirect(url_for("admin"))
-
 
 @app.post("/admin/entry/delete/<int:entry_id>")
 def entry_delete(entry_id: int):
@@ -482,7 +546,6 @@ def entry_delete(entry_id: int):
     flash("Entry deleted.", "success")
     return redirect(url_for("admin"))
 
-
 @app.post("/admin/category/delete/<int:cat_id>")
 def category_delete(cat_id: int):
     require_admin()
@@ -496,7 +559,6 @@ def category_delete(cat_id: int):
     conn.close()
     flash("Category deleted.", "success")
     return redirect(url_for("admin"))
-
 
 @app.get("/admin/results")
 def admin_results():
@@ -525,7 +587,6 @@ def admin_results():
             "content": render_template_string(TPL_RESULTS, tallies=tallies),
         },
     )
-
 
 @app.post("/admin/purge")
 def admin_purge():
@@ -559,7 +620,6 @@ def admin_purge():
     flash("All data purged. Defaults re-seeded and uploads cleared.", "success")
     return redirect(url_for("admin"))
 
-
 # ---------------------------- TEMPLATES ----------------------------
 
 TPL_BASE = r"""
@@ -581,7 +641,6 @@ TPL_BASE = r"""
     .grid{display:grid;gap:16px}
     .grid.cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}
     .grid.cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}
-    /* Responsive grid for entry cards on vote page */
     .btn{display:inline-block;background:var(--accent);color:black;padding:10px 14px;border-radius:10px;font-weight:600;border:none;cursor:pointer}
     .btn.secondary{background:#2a2f39;color:var(--ink)}
     .btn.danger{background:#d84a4a;color:white}
@@ -665,49 +724,72 @@ TPL_ENTRY_FORM = r"""
 </form>
 """
 
-TPL_VOTE_FORM = r"""
+# Wizard template: one category per step
+TPL_VOTE_WIZARD = r"""
 <h3>Cast Your Votes</h3>
-<form action="{{ url_for('vote_submit') }}" method="post">
+
+{% set total = categories|length %}
+{% set step = idx + 1 %}
+<div style="margin: 12px 0;">
+  <div class="muted">Category {{ step }} of {{ total }}</div>
+  <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px;">
+    <div style="height:100%;width:{{ (step / total * 100)|round(0,'floor') }}%;background:var(--accent);"></div>
+  </div>
+</div>
+
+<form action="{{ url_for('vote_step_post', idx=idx) }}" method="post">
+  {% if idx == 0 %}
   <div class="grid cols-2 mb-4">
     <div>
       <label>Your First Name</label>
-      <input name="voter_first" required />
+      <input name="voter_first" value="{{ voter_first or '' }}" required />
     </div>
     <div>
       <label>Your Last Name</label>
-      <input name="voter_last" required />
+      <input name="voter_last" value="{{ voter_last or '' }}" required />
     </div>
   </div>
-  {% if not entries %}
-    <p class="muted">No costumes have been submitted yet.</p>
-  {% else %}
+  {% endif %}
+
+  <div class="category-section" style="margin:1.0em 0; padding:1em; background:#222; border-radius:12px;">
+    <h2 style="font-size:1.2em; color:#ffd700; border-bottom:1px solid #555; padding-bottom:0.3em; margin-top:0;">
+      {{ category.name }}
+    </h2>
+
     <style>
       .entries-grid {display:grid; gap:16px; grid-template-columns:repeat(2,minmax(0,1fr));}
       @media (min-width:1024px) {.entries-grid {grid-template-columns:repeat(3,minmax(0,1fr));}}
     </style>
-    {% for cat in categories %}
-      <div class="category-section" style="margin:1.5em 0; padding:1em; background:#222; border-radius:12px;">
-        <h2 style="font-size:1.4em; color:#ffd700; border-bottom:1px solid #555; padding-bottom:0.3em;">
-          {{ cat.name }}
-        </h2>
-        <div class="entries-grid">
-          {% for e in entries %}
-            <label class="card" style="cursor:pointer">
-              <input type="radio" name="cat_{{cat.id}}" value="{{e.id}}" style="margin-bottom:8px" required />
-              {% if e.photo_path %}
-                <img class="thumb" src="{{ url_for('uploaded_file', filename=e.photo_path) }}" alt="{{ e.costume_name }}" />
-              {% else %}
-                <div class="thumb" style="display:flex;align-items:center;justify-content:center">No Photo</div>
-              {% endif %}
-              <div class="mb-2"><strong>{{ e.costume_name }}</strong></div>
-              <div class="muted">By {{ e.first_name }} {{ e.last_name }}</div>
-            </label>
-          {% endfor %}
-        </div>
-      </div>
-    {% endfor %}
-    <button class="btn" type="submit">Submit Ballot</button>
-  {% endif %}
+    <div class="entries-grid">
+      {% for e in entries %}
+        <label class="card" style="cursor:pointer">
+          <input type="radio" name="choice_entry_id" value="{{e.id}}" style="margin-bottom:8px"
+                 {% if ballot.get(category.id|string) == e.id %}checked{% endif %} />
+          {% if e.photo_path %}
+            <img class="thumb" src="{{ url_for('uploaded_file', filename=e.photo_path) }}" alt="{{ e.costume_name }}" />
+          {% else %}
+            <div class="thumb" style="display:flex;align-items:center;justify-content:center">No Photo</div>
+          {% endif %}
+          <div class="mb-2"><strong>{{ e.costume_name }}</strong></div>
+          <div class="muted">By {{ e.first_name }} {{ e.last_name }}</div>
+        </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="row" style="justify-content:space-between">
+    {% if idx > 0 %}
+      <button class="btn secondary" name="nav" value="prev" type="submit">← Back</button>
+    {% else %}
+      <span></span>
+    {% endif %}
+
+    {% if idx + 1 < total %}
+      <button class="btn" name="nav" value="next" type="submit">Next →</button>
+    {% else %}
+      <button class="btn" name="nav" value="finish" type="submit">Submit Ballot ✅</button>
+    {% endif %}
+  </div>
 </form>
 """
 
@@ -813,7 +895,6 @@ TPL_RESULTS = r"""
   </div>
 {% endfor %}
 """
-
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
