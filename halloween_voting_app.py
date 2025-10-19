@@ -6,7 +6,7 @@ Self-hostable, lightweight, no external DB required.
 Features
 - Attendee entry: first name, last name, costume name, optional photo upload
 - Admin dashboard: view/delete entries, enable/disable voting, manage categories (add/rename/delete)
-- Voting wizard (when enabled): voter name + one category per screen with Back/Next/Finish
+- Voting wizard: name-only first page, then one category per screen with Back/Next/Finish
 - Results tally (admin-only)
 - Duplicate-vote protection by unique voter full name (case-insensitive)
 - One-click purge: wipe all data and reseed defaults
@@ -261,10 +261,10 @@ def entry_submit():
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
-# --- Voting (Wizard) ---
+# --- Voting (Wizard with name-only first page) ---
 @app.get("/vote")
 def vote_form():
-    """Redirect into the wizard if voting is enabled; otherwise show 'closed'."""
+    """Redirect into the wizard (name page first) if voting is enabled; otherwise show 'closed'."""
     if get_setting("voting_enabled", "0") != "1":
         return render_template_string(
             TPL_BASE,
@@ -273,8 +273,8 @@ def vote_form():
                 "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
             },
         )
-    # start at first category
-    return redirect(url_for("vote_step", idx=0))
+    # start at the name page (idx = -1)
+    return redirect(url_for("vote_step", idx=-1))
 
 @app.get("/vote/step/<int:idx>")
 def vote_step(idx: int):
@@ -288,6 +288,27 @@ def vote_step(idx: int):
         )
 
     cats = _enabled_categories()
+    total_steps = len(cats) + 1  # name page + each category
+
+    # Name-only page
+    if idx == -1:
+        voter_first = session.get("voter_first", "")
+        voter_last = session.get("voter_last", "")
+        return render_template_string(
+            TPL_BASE,
+            **{
+                "page_title": "Cast Your Votes",
+                "content": render_template_string(
+                    TPL_VOTE_NAME,
+                    voter_first=voter_first,
+                    voter_last=voter_last,
+                    step=1,                 # first step
+                    total=total_steps,
+                ),
+            },
+        )
+
+    # Bounds check for category pages
     if not cats:
         return render_template_string(
             TPL_BASE,
@@ -297,13 +318,13 @@ def vote_step(idx: int):
             },
         )
     if idx < 0 or idx >= len(cats):
-        return redirect(url_for("vote_step", idx=0))
+        return redirect(url_for("vote_step", idx=-1))
 
     entries = _all_entries()
     ballot = session.get("ballot", {})  # {category_id(str): entry_id}
-    voter_first = session.get("voter_first", "")
-    voter_last = session.get("voter_last", "")
 
+    # progress: after name page, categories are steps 2..N+1
+    step_display = 1 + 1 + idx        # 1 (name) + current category offset
     return render_template_string(
         TPL_BASE,
         **{
@@ -315,8 +336,8 @@ def vote_step(idx: int):
                 entries=entries,
                 idx=idx,
                 ballot=ballot,
-                voter_first=voter_first,
-                voter_last=voter_last,
+                step=step_display,
+                total=total_steps,
             ),
         },
     )
@@ -326,22 +347,26 @@ def vote_step_post(idx: int):
     if get_setting("voting_enabled", "0") != "1":
         abort(403)
 
-    # Update voter name on first step
-    if idx == 0:
+    cats = _enabled_categories()
+
+    # Name-only page submit
+    if idx == -1:
         vf = request.form.get("voter_first", "").strip()
         vl = request.form.get("voter_last", "").strip()
         if not vf or not vl:
             flash("Please enter your first and last name.", "error")
-            return redirect(url_for("vote_step", idx=idx))
+            return redirect(url_for("vote_step", idx=-1))
         session["voter_first"] = vf
         session["voter_last"] = vl
+        # Move to first category
+        return redirect(url_for("vote_step", idx=0))
 
-    cats = _enabled_categories()
+    # Category pages
     if not cats:
         flash("No categories are enabled.", "error")
         return redirect(url_for("home"))
     if idx < 0 or idx >= len(cats):
-        return redirect(url_for("vote_step", idx=0))
+        return redirect(url_for("vote_step", idx=-1))
 
     current_cat = cats[idx]
     choice = request.form.get("choice_entry_id")
@@ -355,7 +380,8 @@ def vote_step_post(idx: int):
 
     nav = request.form.get("nav", "next")
     if nav == "prev":
-        return redirect(url_for("vote_step", idx=max(0, idx - 1)))
+        # Back from first category returns to the name page
+        return redirect(url_for("vote_step", idx=(idx - 1) if idx > 0 else -1))
     elif nav == "next":
         return redirect(url_for("vote_step", idx=min(len(cats) - 1, idx + 1)))
     else:  # finish
@@ -370,7 +396,7 @@ def vote_finish():
     voter_last = session.get("voter_last", "").strip()
     if not voter_first or not voter_last:
         flash("Missing voter name; please start again.", "error")
-        return redirect(url_for("vote_step", idx=0))
+        return redirect(url_for("vote_step", idx=-1))
 
     conn = get_db()
     existing = conn.execute(
@@ -651,7 +677,7 @@ TPL_BASE = r"""
       border:1px solid #2b2f3a;
       background:#0f1115;
       color:var(--ink);
-      box-sizing:border-box;
+      box-sizing:border-box; /* prevent crowding */
     }
     label{font-size:.9rem;color:var(--muted)}
     .muted{color:var(--muted)}
@@ -732,22 +758,24 @@ TPL_ENTRY_FORM = r"""
 </form>
 """
 
-# Wizard template: one category per step
-TPL_VOTE_WIZARD = r"""
+# Name-only first page for the wizard (idx = -1)
+TPL_VOTE_NAME = r"""
 <h3>Cast Your Votes</h3>
 
-{% set total = categories|length %}
-{% set step = idx + 1 %}
 <div style="margin: 12px 0;">
-  <div class="muted">Category {{ step }} of {{ total }}</div>
+  <div class="muted">Step {{ step }} of {{ total }}</div>
   <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px;">
     <div style="height:100%;width:{{ (step / total * 100)|round(0,'floor') }}%;background:var(--accent);"></div>
   </div>
 </div>
 
-<form action="{{ url_for('vote_step_post', idx=idx) }}" method="post">
-  {% if idx == 0 %}
-  <div class="grid cols-2 mb-4">
+<style>
+  .form-name-grid{display:grid; grid-template-columns:1fr; gap:16px;}
+  @media (min-width:720px){ .form-name-grid{ grid-template-columns:1fr 1fr; } }
+</style>
+
+<form action="{{ url_for('vote_step_post', idx=-1) }}" method="post">
+  <div class="form-name-grid mb-4">
     <div>
       <label>Your First Name</label>
       <input name="voter_first" value="{{ voter_first or '' }}" required />
@@ -757,8 +785,25 @@ TPL_VOTE_WIZARD = r"""
       <input name="voter_last" value="{{ voter_last or '' }}" required />
     </div>
   </div>
-  {% endif %}
 
+  <div class="row" style="justify-content:flex-end">
+    <button class="btn" name="nav" value="next" type="submit">Start Voting →</button>
+  </div>
+</form>
+"""
+
+# Wizard template: one category per step (name page is separate)
+TPL_VOTE_WIZARD = r"""
+<h3>Cast Your Votes</h3>
+
+<div style="margin: 12px 0;">
+  <div class="muted">Category {{ step - 1 }} of {{ total - 1 }}</div>
+  <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px;">
+    <div style="height:100%;width:{{ (step / total * 100)|round(0,'floor') }}%;background:var(--accent);"></div>
+  </div>
+</div>
+
+<form action="{{ url_for('vote_step_post', idx=idx) }}" method="post">
   <div class="category-section" style="margin:1.0em 0; padding:1em; background:#222; border-radius:12px;">
     <h2 style="font-size:1.2em; color:#ffd700; border-bottom:1px solid #555; padding-bottom:0.3em; margin-top:0;">
       {{ category.name }}
@@ -786,13 +831,8 @@ TPL_VOTE_WIZARD = r"""
   </div>
 
   <div class="row" style="justify-content:space-between">
-    {% if idx > 0 %}
-      <button class="btn secondary" name="nav" value="prev" type="submit">← Back</button>
-    {% else %}
-      <span></span>
-    {% endif %}
-
-    {% if idx + 1 < total %}
+    <button class="btn secondary" name="nav" value="prev" type="submit">← Back</button>
+    {% if idx + 1 < categories|length %}
       <button class="btn" name="nav" value="next" type="submit">Next →</button>
     {% else %}
       <button class="btn" name="nav" value="finish" type="submit">Submit Ballot ✅</button>
