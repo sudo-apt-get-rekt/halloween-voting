@@ -644,7 +644,15 @@ TPL_BASE = r"""
     .btn{display:inline-block;background:var(--accent);color:black;padding:10px 14px;border-radius:10px;font-weight:600;border:none;cursor:pointer}
     .btn.secondary{background:#2a2f39;color:var(--ink)}
     .btn.danger{background:#d84a4a;color:white}
-    input,select{width:100%;padding:10px;border-radius:10px;border:1px solid #2b2f3a;background:#0f1115;color:var(--ink)}
+    input,select{
+      width:100%;
+      padding:10px;
+      border-radius:10px;
+      border:1px solid #2b2f3a;
+      background:#0f1115;
+      color:var(--ink);
+      box-sizing:border-box;
+    }
     label{font-size:.9rem;color:var(--muted)}
     .muted{color:var(--muted)}
     .text-center{text-align:center}
