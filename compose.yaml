@@ -1,11 +1,18 @@
+# docker-compose.yml
 services:
-halloween:
-ports:
-  - "8000:8000"
-environment:
-FLASK_SECRET: "change-me"
-ADMIN_PASSWORD: "changeme"
-volumes:
-  - ./data:/data
-  - ./uploads:/uploads
-restart: unless-stopped
+  halloween:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      FLASK_SECRET: "replace-with-strong-random"
+      ADMIN_PASSWORD: "changeme"
+      # Optional overrides:
+      # DATA_DIR: "/data"
+      # UPLOAD_DIR: "/uploads"
+    volumes:
+      - ./data:/data
+      - ./uploads:/uploads
+    restart: unless-stopped
