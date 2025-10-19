@@ -1,0 +1,13 @@
+services:
+halloween:
+build: .
+# image: ghcr.io/you/halloween-voting:latest # use after pushing
+ports:
+- "8000:8000"
+environment:
+FLASK_SECRET: "change-me"
+ADMIN_PASSWORD: "changeme"
+volumes:
+- ./data:/data
+- ./uploads:/uploads
+restart: unless-stopped
