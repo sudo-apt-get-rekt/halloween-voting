@@ -33,8 +33,15 @@ from pathlib import Path
 from typing import Optional
 
 from flask import (
-    Flask, request, redirect, url_for, render_template_string, flash,
-    send_from_directory, session, abort
+    Flask,
+    request,
+    redirect,
+    url_for,
+    render_template_string,
+    flash,
+    send_from_directory,
+    session,
+    abort,
 )
 from werkzeug.utils import secure_filename
 
@@ -53,6 +60,7 @@ app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(16))
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
 # -------------------------- DB UTILITIES ---------------------------
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -138,9 +146,7 @@ def init_db():
     # seed voting_enabled setting
     cur.execute("SELECT value FROM settings WHERE key='voting_enabled'")
     if cur.fetchone() is None:
-        cur.execute(
-            "INSERT INTO settings(key, value) VALUES('voting_enabled', '0')"
-        )
+        cur.execute("INSERT INTO settings(key, value) VALUES('voting_enabled', '0')")
 
     conn.commit()
     conn.close()
@@ -152,6 +158,7 @@ def ensure_db():
 
 
 # ---------------------------- HELPERS ------------------------------
+
 
 def is_admin() -> bool:
     return session.get("admin", False) is True
@@ -189,25 +196,32 @@ def set_setting(key: str, value: str) -> None:
 
 # ------------------------------ ROUTES -----------------------------
 
+
 @app.get("/")
 def home():
     voting_enabled = get_setting("voting_enabled", "0") == "1"
-    return render_template_string(TPL_BASE, **{
-        "page_title": APP_NAME,
-        "content": render_template_string(
-            TPL_HOME,
-            voting_enabled=voting_enabled,
-        ),
-    })
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": APP_NAME,
+            "content": render_template_string(
+                TPL_HOME,
+                voting_enabled=voting_enabled,
+            ),
+        },
+    )
 
 
 # --- Entries ---
 @app.get("/entry")
 def entry_form():
-    return render_template_string(TPL_BASE, **{
-        "page_title": "Submit Your Costume",
-        "content": render_template_string(TPL_ENTRY_FORM),
-    })
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": "Submit Your Costume",
+            "content": render_template_string(TPL_ENTRY_FORM),
+        },
+    )
 
 
 @app.post("/entry")
@@ -243,28 +257,40 @@ def entry_submit():
     return redirect(url_for("home"))
 
 
-@app.get('/uploads/<path:filename>')
+@app.get("/uploads/<path:filename>")
 def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
 
 # --- Voting ---
 @app.get("/vote")
 def vote_form():
     if get_setting("voting_enabled", "0") != "1":
-        return render_template_string(TPL_BASE, **{
-            "page_title": "Voting Closed",
-            "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
-        })
+        return render_template_string(
+            TPL_BASE,
+            **{
+                "page_title": "Voting Closed",
+                "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
+            },
+        )
 
     conn = get_db()
-    cats = conn.execute("SELECT id, name FROM categories WHERE enabled=1 ORDER BY name").fetchall()
-    entries = conn.execute("SELECT id, first_name, last_name, costume_name, photo_path FROM entries ORDER BY created_at DESC").fetchall()
+    cats = conn.execute(
+        "SELECT id, name FROM categories WHERE enabled=1 ORDER BY name"
+    ).fetchall()
+    entries = conn.execute(
+        "SELECT id, first_name, last_name, costume_name, photo_path FROM entries ORDER BY created_at DESC"
+    ).fetchall()
     conn.close()
-    return render_template_string(TPL_BASE, **{
-        "page_title": "Cast Your Votes",
-        "content": render_template_string(TPL_VOTE_FORM, categories=cats, entries=entries),
-    })
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": "Cast Your Votes",
+            "content": render_template_string(
+                TPL_VOTE_FORM, categories=cats, entries=entries
+            ),
+        },
+    )
 
 
 @app.post("/vote")
@@ -320,28 +346,36 @@ def vote_submit():
 @app.get("/admin")
 def admin():
     if not is_admin():
-        return render_template_string(TPL_BASE, **{
-            "page_title": "Admin Login",
-            "content": render_template_string(TPL_ADMIN_LOGIN),
-        })
+        return render_template_string(
+            TPL_BASE,
+            **{
+                "page_title": "Admin Login",
+                "content": render_template_string(TPL_ADMIN_LOGIN),
+            },
+        )
 
     conn = get_db()
     entries = conn.execute(
         "SELECT id, first_name, last_name, costume_name, photo_path, created_at FROM entries ORDER BY created_at DESC"
     ).fetchall()
-    cats = conn.execute("SELECT id, name, enabled FROM categories ORDER BY name").fetchall()
+    cats = conn.execute(
+        "SELECT id, name, enabled FROM categories ORDER BY name"
+    ).fetchall()
     voting_enabled = get_setting("voting_enabled", "0") == "1"
     conn.close()
 
-    return render_template_string(TPL_BASE, **{
-        "page_title": "Admin Dashboard",
-        "content": render_template_string(
-            TPL_ADMIN_DASH,
-            entries=entries,
-            categories=cats,
-            voting_enabled=voting_enabled,
-        ),
-    })
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": "Admin Dashboard",
+            "content": render_template_string(
+                TPL_ADMIN_DASH,
+                entries=entries,
+                categories=cats,
+                voting_enabled=voting_enabled,
+            ),
+        },
+    )
 
 
 @app.post("/admin/login")
@@ -395,7 +429,9 @@ def category_add():
 def category_toggle(cat_id: int):
     require_admin()
     conn = get_db()
-    cur = conn.execute("SELECT enabled FROM categories WHERE id=?", (cat_id,)).fetchone()
+    cur = conn.execute(
+        "SELECT enabled FROM categories WHERE id=?", (cat_id,)
+    ).fetchone()
     if cur is None:
         conn.close()
         abort(404)
@@ -425,11 +461,14 @@ def category_rename(cat_id: int):
         conn.close()
     return redirect(url_for("admin"))
 
+
 @app.post("/admin/entry/delete/<int:entry_id>")
 def entry_delete(entry_id: int):
     require_admin()
     conn = get_db()
-    row = conn.execute("SELECT photo_path FROM entries WHERE id=?", (entry_id,)).fetchone()
+    row = conn.execute(
+        "SELECT photo_path FROM entries WHERE id=?", (entry_id,)
+    ).fetchone()
     conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
     conn.commit()
     conn.close()
@@ -442,6 +481,7 @@ def entry_delete(entry_id: int):
 
     flash("Entry deleted.", "success")
     return redirect(url_for("admin"))
+
 
 @app.post("/admin/category/delete/<int:cat_id>")
 def category_delete(cat_id: int):
@@ -478,10 +518,13 @@ def admin_results():
         tallies[c["name"]] = rows
     conn.close()
 
-    return render_template_string(TPL_BASE, **{
-        "page_title": "Results",
-        "content": render_template_string(TPL_RESULTS, tallies=tallies),
-    })
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": "Results",
+            "content": render_template_string(TPL_RESULTS, tallies=tallies),
+        },
+    )
 
 
 @app.post("/admin/purge")
