@@ -9,6 +9,7 @@ Features
 - Voting wizard: name-only first page (/vote/name), then one category per screen with Back/Next/Finish
 - Results tally (admin-only)
 - Audit view (admin): see who voted for what + CSV export
+- Public "Stats for Nerds": /stats (HTML) and /stats.json
 - Duplicate-vote protection by unique voter full name (case-insensitive)
 - One-click purge: wipe all data and reseed defaults
 
@@ -26,25 +27,29 @@ Notes
 - To reset database manually: stop the app and delete halloween.db and uploads/*
 """
 from __future__ import annotations
-import os
-import sqlite3
-import secrets
+
 import datetime as dt
+import os
+import secrets
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
 from flask import (
     Flask,
-    request,
-    redirect,
-    url_for,
-    render_template_string,
+    Response,
+    abort,
     flash,
+    redirect,
+    render_template_string,
+    request,
     send_from_directory,
     session,
-    abort,
+    url_for,
 )
 from werkzeug.utils import secure_filename
+
+# ---------------------------- CONFIG -----------------------------
 
 APP_NAME = "Halloween Costume Voting"
 DB_PATH = Path("halloween.db")
@@ -54,13 +59,17 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5 MB
 ALLOWED_EXTS = {"jpg", "jpeg", "png", "gif"}
 
+EXPECTED_ATTENDEES = int(os.environ.get("EXPECTED_ATTENDEES", "0"))  # 0 = unknown
+APP_START_TS = dt.datetime.utcnow()  # uptime origin
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 app.config["UPLOAD_FOLDER"] = str(UPLOAD_DIR)
 app.secret_key = os.environ.get("FLASK_SECRET", secrets.token_hex(16))
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme")
 
-# -------------------------- DB UTILITIES ---------------------------
+# -------------------------- DB UTILITIES -------------------------
+
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -68,168 +77,206 @@ def get_db():
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
+
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            first_name TEXT NOT NULL,
-            last_name TEXT NOT NULL,
-            costume_name TEXT NOT NULL,
-            photo_path TEXT,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            enabled INTEGER NOT NULL DEFAULT 1
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            voter_first TEXT NOT NULL,
-            voter_last TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS vote_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vote_id INTEGER NOT NULL,
-            category_id INTEGER NOT NULL,
-            entry_id INTEGER NOT NULL,
-            FOREIGN KEY(vote_id) REFERENCES votes(id) ON DELETE CASCADE,
-            FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE,
-            FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE,
-            UNIQUE(vote_id, category_id)
-        );
-        """
-    )
-
-    # optional indexes for faster admin queries
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_votes_name ON votes(LOWER(voter_first), LOWER(voter_last));")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_vote ON vote_items(vote_id);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_cat ON vote_items(category_id);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_entry ON vote_items(entry_id);")
-
-    # seed categories if empty
-    cur.execute("SELECT COUNT(*) FROM categories")
-    if cur.fetchone()[0] == 0:
-        cur.executemany(
-            "INSERT OR IGNORE INTO categories(name, enabled) VALUES(?, 1)",
-            [
-                ("Most Realistic Costume",),
-                ("Funniest Costume",),
-                ("Scariest Costume",),
-                ("Best Homemade Costume",),
-                ("Least Effort Costume",),
-                ("Classic Halloween Costume",),
-                ("Cutest Costume",),
-            ],
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL,
+                costume_name TEXT NOT NULL,
+                photo_path TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS votes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voter_first TEXT NOT NULL,
+                voter_last TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vote_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vote_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                entry_id INTEGER NOT NULL,
+                FOREIGN KEY(vote_id) REFERENCES votes(id) ON DELETE CASCADE,
+                FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE,
+                FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE,
+                UNIQUE(vote_id, category_id)
+            );
+            """
         )
 
-    # seed voting_enabled setting
-    cur.execute("SELECT value FROM settings WHERE key='voting_enabled'")
-    if cur.fetchone() is None:
-        cur.execute("INSERT INTO settings(key, value) VALUES('voting_enabled', '0')")
+        # Indexes for faster admin queries
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_votes_name ON votes(LOWER(voter_first), LOWER(voter_last));"
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_vote ON vote_items(vote_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_cat ON vote_items(category_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_entry ON vote_items(entry_id);")
 
-    conn.commit()
-    conn.close()
+        # Seed categories if empty
+        cur.execute("SELECT COUNT(*) FROM categories")
+        if cur.fetchone()[0] == 0:
+            cur.executemany(
+                "INSERT OR IGNORE INTO categories(name, enabled) VALUES(?, 1)",
+                [
+                    ("Most Realistic Costume",),
+                    ("Funniest Costume",),
+                    ("Scariest Costume",),
+                    ("Best Homemade Costume",),
+                    ("Least Effort Costume",),
+                    ("Classic Halloween Costume",),
+                    ("Cutest Costume",),
+                ],
+            )
+
+        # Seed voting_enabled setting
+        cur.execute("SELECT value FROM settings WHERE key='voting_enabled'")
+        if cur.fetchone() is None:
+            cur.execute("INSERT INTO settings(key, value) VALUES('voting_enabled', '0')")
+
 
 @app.before_request
 def ensure_db():
     init_db()
 
-# ---------------------------- HELPERS ------------------------------
+
+# ---------------------------- HELPERS ----------------------------
+
+
+def page(title: str, content_html: str):
+    return render_template_string(TPL_BASE, page_title=title, content=content_html)
+
+
+def voting_closed():
+    return page(
+        "Voting Closed",
+        "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
+    )
+
 
 def is_admin() -> bool:
     return session.get("admin", False) is True
+
 
 def require_admin():
     if not is_admin():
         abort(403)
 
+
 def allowed_file(filename: str) -> bool:
-    if "." not in filename:
-        return False
-    ext = filename.rsplit(".", 1)[1].lower()
-    return ext in ALLOWED_EXTS
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTS
+
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = get_db()
-    cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row["value"] if row else default
+    with get_db() as conn:
+        cur = conn.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else default
+
 
 def set_setting(key: str, value: str) -> None:
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
 
 def _enabled_categories():
-    conn = get_db()
-    rows = conn.execute("SELECT id, name FROM categories WHERE enabled=1 ORDER BY name").fetchall()
-    conn.close()
-    return rows
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT id, name FROM categories WHERE enabled=1 ORDER BY name"
+        ).fetchall()
+
 
 def _all_entries():
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, first_name, last_name, costume_name, photo_path FROM entries ORDER BY created_at DESC"
-    ).fetchall()
-    conn.close()
-    return rows
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT id, first_name, last_name, costume_name, photo_path "
+            "FROM entries ORDER BY created_at DESC"
+        ).fetchall()
 
-# ------------------------------ ROUTES -----------------------------
+
+# Short redirect helpers
+def to_admin():
+    return redirect(url_for("admin"))
+
+
+def to_home():
+    return redirect(url_for("home"))
+
+
+def to_name():
+    return redirect(url_for("vote_name"))
+
+
+def to_step(i: int):
+    return redirect(url_for("vote_step", idx=i))
+
+
+# ------------------------------ PUBLIC ----------------------------
+
 
 @app.get("/")
 def home():
     voting_enabled = get_setting("voting_enabled", "0") == "1"
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": APP_NAME,
-            "content": render_template_string(
-                TPL_HOME,
-                voting_enabled=voting_enabled,
-            ),
-        },
+    return page(
+        "Halloween Costume Voting",
+        render_template_string(TPL_HOME, voting_enabled=voting_enabled),
     )
+
+
+@app.get("/stats")
+def public_stats():
+    data = stats_gather()
+    return page("Stats for Nerds", render_template_string(TPL_ADMIN_STATS, d=data))
+
+
+@app.get("/stats.json")
+def public_stats_json():
+    import json
+
+    return Response(
+        json.dumps(stats_gather(), indent=2), mimetype="application/json"
+    )
+
 
 # --- Entries ---
 @app.get("/entry")
 def entry_form():
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Submit Your Costume",
-            "content": render_template_string(TPL_ENTRY_FORM),
-        },
-    )
+    return page("Submit Your Costume", render_template_string(TPL_ENTRY_FORM))
+
 
 @app.post("/entry")
 def entry_submit():
@@ -252,61 +299,54 @@ def entry_submit():
         file.save(save_path)
         photo_path = unique
 
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO entries(first_name, last_name, costume_name, photo_path, created_at) VALUES(?,?,?,?,?)",
-        (first, last, costume, photo_path, dt.datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO entries(first_name, last_name, costume_name, photo_path, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (first, last, costume, photo_path, dt.datetime.utcnow().isoformat()),
+        )
+
     flash("Costume submitted!", "success")
     return redirect(url_for("home"))
+
 
 @app.get("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
 
-# --- Voting (name page + category wizard) ---
+
+# ------------------------------ VOTING ----------------------------
+
+
 @app.get("/vote")
 def vote_form():
     """Redirect into the wizard (name page first) if voting is enabled; otherwise show 'closed'."""
     if get_setting("voting_enabled", "0") != "1":
-        return render_template_string(
-            TPL_BASE,
-            **{
-                "page_title": "Voting Closed",
-                "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
-            },
-        )
-    return redirect(url_for("vote_name"))
+        return voting_closed()
+    return to_name()
+
 
 @app.get("/vote/name")
 def vote_name():
     if get_setting("voting_enabled", "0") != "1":
-        return render_template_string(
-            TPL_BASE,
-            **{
-                "page_title": "Voting Closed",
-                "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
-            },
-        )
+        return voting_closed()
+
     cats = _enabled_categories()
     total_steps = len(cats) + 1  # name page + each category
     voter_first = session.get("voter_first", "")
     voter_last = session.get("voter_last", "")
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Cast Your Votes",
-            "content": render_template_string(
-                TPL_VOTE_NAME,
-                voter_first=voter_first,
-                voter_last=voter_last,
-                step=1,
-                total=total_steps,
-            ),
-        },
+
+    return page(
+        "Cast Your Votes",
+        render_template_string(
+            TPL_VOTE_NAME,
+            voter_first=voter_first,
+            voter_last=voter_last,
+            step=1,
+            total=total_steps,
+        ),
     )
+
 
 @app.post("/vote/name")
 def vote_name_post():
@@ -316,55 +356,42 @@ def vote_name_post():
     vl = request.form.get("voter_last", "").strip()
     if not vf or not vl:
         flash("Please enter your first and last name.", "error")
-        return redirect(url_for("vote_name"))
+        return to_name()
     session["voter_first"] = vf
     session["voter_last"] = vl
-    return redirect(url_for("vote_step", idx=0))
+    return to_step(0)
+
 
 @app.get("/vote/step/<int:idx>")
 def vote_step(idx: int):
     if get_setting("voting_enabled", "0") != "1":
-        return render_template_string(
-            TPL_BASE,
-            **{
-                "page_title": "Voting Closed",
-                "content": "<p class='text-center text-lg'>Voting is currently closed. Please check back later.</p>",
-            },
-        )
+        return voting_closed()
 
     cats = _enabled_categories()
     if not cats:
-        return render_template_string(
-            TPL_BASE,
-            **{
-                "page_title": "Cast Your Votes",
-                "content": "<p class='muted'>No categories are enabled.</p>",
-            },
-        )
+        return page("Cast Your Votes", "<p class='muted'>No categories are enabled.</p>")
     if idx < 0 or idx >= len(cats):
-        return redirect(url_for("vote_name"))
+        return to_name()
 
     entries = _all_entries()
     ballot = session.get("ballot", {})
     total_steps = len(cats) + 1
     step_display = 2 + idx  # 1=name, 2=first category
 
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Cast Your Votes",
-            "content": render_template_string(
-                TPL_VOTE_WIZARD,
-                categories=cats,
-                category=cats[idx],
-                entries=entries,
-                idx=idx,
-                ballot=ballot,
-                step=step_display,
-                total=total_steps,
-            ),
-        },
+    return page(
+        "Cast Your Votes",
+        render_template_string(
+            TPL_VOTE_WIZARD,
+            categories=cats,
+            category=cats[idx],
+            entries=entries,
+            idx=idx,
+            ballot=ballot,
+            step=step_display,
+            total=total_steps,
+        ),
     )
+
 
 @app.post("/vote/step/<int:idx>")
 def vote_step_post(idx: int):
@@ -374,9 +401,9 @@ def vote_step_post(idx: int):
     cats = _enabled_categories()
     if not cats:
         flash("No categories are enabled.", "error")
-        return redirect(url_for("home"))
+        return to_home()
     if idx < 0 or idx >= len(cats):
-        return redirect(url_for("vote_name"))
+        return to_name()
 
     current_cat = cats[idx]
     choice = request.form.get("choice_entry_id")
@@ -390,11 +417,12 @@ def vote_step_post(idx: int):
 
     nav = request.form.get("nav", "next")
     if nav == "prev":
-        return redirect(url_for("vote_step", idx=idx - 1)) if idx > 0 else redirect(url_for("vote_name"))
+        return to_step(idx - 1) if idx > 0 else to_name()
     elif nav == "next":
-        return redirect(url_for("vote_step", idx=min(len(cats) - 1, idx + 1)))
+        return to_step(min(len(cats) - 1, idx + 1))
     else:  # finish
         return redirect(url_for("vote_finish"))
+
 
 @app.get("/vote/finish")
 def vote_finish():
@@ -405,82 +433,73 @@ def vote_finish():
     voter_last = session.get("voter_last", "").strip()
     if not voter_first or not voter_last:
         flash("Missing voter name; please start again.", "error")
-        return redirect(url_for("vote_name"))
+        return to_name()
 
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM votes WHERE LOWER(voter_first)=LOWER(?) AND LOWER(voter_last)=LOWER(?)",
-        (voter_first, voter_last),
-    ).fetchone()
-    if existing:
-        conn.close()
-        flash("Our records show you've already submitted a ballot.", "error")
-        return redirect(url_for("home"))
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM votes WHERE LOWER(voter_first)=LOWER(?) AND LOWER(voter_last)=LOWER(?)",
+            (voter_first, voter_last),
+        ).fetchone()
+        if existing:
+            flash("Our records show you've already submitted a ballot.", "error")
+            return to_home()
 
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO votes(voter_first, voter_last, created_at) VALUES(?,?,?)",
-        (voter_first, voter_last, dt.datetime.utcnow().isoformat()),
-    )
-    vote_id = cur.lastrowid
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO votes(voter_first, voter_last, created_at) VALUES(?,?,?)",
+            (voter_first, voter_last, dt.datetime.utcnow().isoformat()),
+        )
+        vote_id = cur.lastrowid
 
-    cats = _enabled_categories()
-    ballot = session.get("ballot", {})
-    for c in cats:
-        key = str(c["id"])
-        entry_id = ballot.get(key)
-        if entry_id:
-            try:
-                cur.execute(
-                    "INSERT INTO vote_items(vote_id, category_id, entry_id) VALUES(?,?,?)",
-                    (vote_id, c["id"], int(entry_id)),
-                )
-            except Exception:
-                pass
-
-    conn.commit()
-    conn.close()
+        cats = _enabled_categories()
+        ballot = session.get("ballot", {})
+        for c in cats:
+            key = str(c["id"])
+            entry_id = ballot.get(key)
+            if entry_id:
+                try:
+                    cur.execute(
+                        "INSERT INTO vote_items(vote_id, category_id, entry_id) VALUES(?,?,?)",
+                        (vote_id, c["id"], int(entry_id)),
+                    )
+                except Exception:
+                    pass
 
     for k in ("voter_first", "voter_last", "ballot"):
         session.pop(k, None)
 
     flash("Thanks! Your ballot has been recorded.", "success")
-    return redirect(url_for("home"))
+    return to_home()
 
-# --- Admin ---
+
+# ------------------------------ ADMIN ----------------------------
+
+
 @app.get("/admin")
 def admin():
     if not is_admin():
-        return render_template_string(
-            TPL_BASE,
-            **{
-                "page_title": "Admin Login",
-                "content": render_template_string(TPL_ADMIN_LOGIN),
-            },
-        )
+        return page("Admin Login", render_template_string(TPL_ADMIN_LOGIN))
 
-    conn = get_db()
-    entries = conn.execute(
-        "SELECT id, first_name, last_name, costume_name, photo_path, created_at FROM entries ORDER BY created_at DESC"
-    ).fetchall()
-    cats = conn.execute(
-        "SELECT id, name, enabled FROM categories ORDER BY name"
-    ).fetchall()
+    with get_db() as conn:
+        entries = conn.execute(
+            "SELECT id, first_name, last_name, costume_name, photo_path, created_at "
+            "FROM entries ORDER BY created_at DESC"
+        ).fetchall()
+        cats = conn.execute(
+            "SELECT id, name, enabled FROM categories ORDER BY name"
+        ).fetchall()
     voting_enabled = get_setting("voting_enabled", "0") == "1"
-    conn.close()
 
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Admin Dashboard",
-            "content": render_template_string(
-                TPL_ADMIN_DASH,
-                entries=entries,
-                categories=cats,
-                voting_enabled=voting_enabled,
-            ),
-        },
+    return page(
+        "Admin Dashboard",
+        render_template_string(
+            TPL_ADMIN_DASH,
+            entries=entries,
+            categories=cats,
+            voting_enabled=voting_enabled,
+        ),
     )
+
 
 @app.post("/admin/login")
 def admin_login():
@@ -488,24 +507,26 @@ def admin_login():
     if pwd == ADMIN_PASSWORD:
         session["admin"] = True
         flash("Logged in as admin.", "success")
-        return redirect(url_for("admin"))
+        return to_admin()
     flash("Invalid password.", "error")
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.post("/admin/logout")
 def admin_logout():
     session.clear()
     flash("Logged out.", "success")
-    return redirect(url_for("home"))
+    return to_home()
+
 
 @app.post("/admin/toggle_voting")
 def toggle_voting():
     require_admin()
     current = get_setting("voting_enabled", "0")
-    new_val = "0" if current == "1" else "1"
-    set_setting("voting_enabled", new_val)
-    flash(f"Voting {'enabled' if new_val=='1' else 'disabled'}.", "success")
-    return redirect(url_for("admin"))
+    set_setting("voting_enabled", "0" if current == "1" else "1")
+    flash(f"Voting {'enabled' if current == '0' else 'disabled'}.", "success")
+    return to_admin()
+
 
 @app.post("/admin/category/add")
 def category_add():
@@ -513,34 +534,27 @@ def category_add():
     name = request.form.get("name", "").strip()
     if not name:
         flash("Category name cannot be empty.", "error")
-        return redirect(url_for("admin"))
-    conn = get_db()
+        return to_admin()
     try:
-        conn.execute("INSERT INTO categories(name, enabled) VALUES(?,1)", (name,))
-        conn.commit()
+        with get_db() as conn:
+            conn.execute("INSERT INTO categories(name, enabled) VALUES(?,1)", (name,))
         flash("Category added.", "success")
     except sqlite3.IntegrityError:
         flash("Category already exists.", "error")
-    finally:
-        conn.close()
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.post("/admin/category/toggle/<int:cat_id>")
 def category_toggle(cat_id: int):
     require_admin()
-    conn = get_db()
-    cur = conn.execute(
-        "SELECT enabled FROM categories WHERE id=?", (cat_id,)
-    ).fetchone()
-    if cur is None:
-        conn.close()
-        abort(404)
-    new_val = 0 if cur["enabled"] else 1
-    conn.execute("UPDATE categories SET enabled=? WHERE id=?", (new_val, cat_id))
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.execute("SELECT enabled FROM categories WHERE id=?", (cat_id,)).fetchone()
+        if cur is None:
+            abort(404)
+        conn.execute("UPDATE categories SET enabled=? WHERE id=?", (0 if cur["enabled"] else 1, cat_id))
     flash("Category updated.", "success")
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.post("/admin/category/rename/<int:cat_id>")
 def category_rename(cat_id: int):
@@ -548,167 +562,310 @@ def category_rename(cat_id: int):
     new_name = request.form.get("new_name", "").strip()
     if not new_name:
         flash("New category name cannot be empty.", "error")
-        return redirect(url_for("admin"))
-    conn = get_db()
+        return to_admin()
     try:
-        conn.execute("UPDATE categories SET name=? WHERE id=?", (new_name, cat_id))
-        conn.commit()
+        with get_db() as conn:
+            conn.execute("UPDATE categories SET name=? WHERE id=?", (new_name, cat_id))
         flash("Category renamed.", "success")
     except sqlite3.IntegrityError:
         flash("A category with that name already exists.", "error")
-    finally:
-        conn.close()
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.post("/admin/entry/delete/<int:entry_id>")
 def entry_delete(entry_id: int):
     require_admin()
-    conn = get_db()
-    row = conn.execute(
-        "SELECT photo_path FROM entries WHERE id=?", (entry_id,)
-    ).fetchone()
-    conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
-    conn.commit()
-    conn.close()
-
+    with get_db() as conn:
+        row = conn.execute("SELECT photo_path FROM entries WHERE id=?", (entry_id,)).fetchone()
+        conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
     if row and row["photo_path"]:
         try:
             (UPLOAD_DIR / row["photo_path"]).unlink(missing_ok=True)
         except Exception:
             pass
-
     flash("Entry deleted.", "success")
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.post("/admin/category/delete/<int:cat_id>")
 def category_delete(cat_id: int):
     require_admin()
-    conn = get_db()
-    cur = conn.execute("SELECT id FROM categories WHERE id=?", (cat_id,)).fetchone()
-    if not cur:
-        conn.close()
-        abort(404)
-    conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        cur = conn.execute("SELECT id FROM categories WHERE id=?", (cat_id,)).fetchone()
+        if not cur:
+            abort(404)
+        conn.execute("DELETE FROM categories WHERE id=?", (cat_id,))
     flash("Category deleted.", "success")
-    return redirect(url_for("admin"))
+    return to_admin()
+
 
 @app.get("/admin/results")
 def admin_results():
     require_admin()
-    conn = get_db()
-    cats = conn.execute("SELECT id, name FROM categories ORDER BY name").fetchall()
     tallies = {}
-    for c in cats:
-        rows = conn.execute(
-            """
-            SELECT e.id as entry_id, e.first_name, e.last_name, e.costume_name, e.photo_path, COUNT(vi.id) as votes
-            FROM entries e
-            LEFT JOIN vote_items vi ON vi.entry_id = e.id AND vi.category_id = ?
-            GROUP BY e.id
-            ORDER BY votes DESC, e.costume_name ASC
-            """,
-            (c["id"],),
-        ).fetchall()
-        tallies[c["name"]] = rows
-    conn.close()
+    with get_db() as conn:
+        cats = conn.execute("SELECT id, name FROM categories ORDER BY name").fetchall()
+        for c in cats:
+            rows = conn.execute(
+                """
+                SELECT e.id as entry_id, e.first_name, e.last_name, e.costume_name, e.photo_path,
+                       COUNT(vi.id) as votes
+                FROM entries e
+                LEFT JOIN vote_items vi
+                  ON vi.entry_id = e.id AND vi.category_id = ?
+                GROUP BY e.id
+                ORDER BY votes DESC, e.costume_name ASC
+                """,
+                (c["id"],),
+            ).fetchall()
+            tallies[c["name"]] = rows
 
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Results",
-            "content": render_template_string(TPL_RESULTS, tallies=tallies),
-        },
-    )
+    return page("Results", render_template_string(TPL_RESULTS, tallies=tallies))
 
-# --- Admin Audit (who voted for what) ---
+
+# -------- Admin Audit (who voted for what) + CSV export ---------
+
+
 @app.get("/admin/audit")
 def admin_audit():
     require_admin()
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT
-          v.id            AS vote_id,
-          v.voter_first   AS voter_first,
-          v.voter_last    AS voter_last,
-          v.created_at    AS voted_at,
-          c.name          AS category_name,
-          e.costume_name  AS costume_name,
-          e.first_name    AS entry_first,
-          e.last_name     AS entry_last
-        FROM votes v
-        JOIN vote_items vi ON vi.vote_id = v.id
-        JOIN categories c  ON c.id = vi.category_id
-        JOIN entries e     ON e.id = vi.entry_id
-        ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
-        """
-    ).fetchall()
-    conn.close()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              v.id           AS vote_id,
+              v.voter_first  AS voter_first,
+              v.voter_last   AS voter_last,
+              v.created_at   AS voted_at,
+              c.name         AS category_name,
+              e.costume_name AS costume_name,
+              e.first_name   AS entry_first,
+              e.last_name    AS entry_last
+            FROM votes v
+            JOIN vote_items vi ON vi.vote_id   = v.id
+            JOIN categories c  ON c.id         = vi.category_id
+            JOIN entries e     ON e.id         = vi.entry_id
+            ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
+            """
+        ).fetchall()
 
-    return render_template_string(
-        TPL_BASE,
-        **{
-            "page_title": "Audit — Who Voted For What",
-            "content": render_template_string(TPL_ADMIN_AUDIT, rows=rows),
-        },
-    )
+    return page("Audit — Who Voted For What", render_template_string(TPL_ADMIN_AUDIT, rows=rows))
+
 
 @app.get("/admin/audit.csv")
 def admin_audit_csv():
     require_admin()
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT
-          v.id            AS vote_id,
-          v.voter_first   AS voter_first,
-          v.voter_last    AS voter_last,
-          v.created_at    AS voted_at,
-          c.name          AS category_name,
-          e.costume_name  AS costume_name,
-          e.first_name    AS entry_first,
-          e.last_name     AS entry_last
-        FROM votes v
-        JOIN vote_items vi ON vi.vote_id = v.id
-        JOIN categories c  ON c.id = vi.category_id
-        JOIN entries e     ON e.id = vi.entry_id
-        ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
-        """
-    ).fetchall()
-    conn.close()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              v.id           AS vote_id,
+              v.voter_first  AS voter_first,
+              v.voter_last   AS voter_last,
+              v.created_at   AS voted_at,
+              c.name         AS category_name,
+              e.costume_name AS costume_name,
+              e.first_name   AS entry_first,
+              e.last_name    AS entry_last
+            FROM votes v
+            JOIN vote_items vi ON vi.vote_id   = v.id
+            JOIN categories c  ON c.id         = vi.category_id
+            JOIN entries e     ON e.id         = vi.entry_id
+            ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
+            """
+        ).fetchall()
 
     # Build CSV
-    import csv, io
+    import csv
+    import io
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["vote_id", "voter_first", "voter_last", "voted_at", "category", "costume_name", "entry_first", "entry_last"])
-    for r in rows:
-        writer.writerow([
-            r["vote_id"],
-            r["voter_first"],
-            r["voter_last"],
-            r["voted_at"],
-            r["category_name"],
-            r["costume_name"],
-            r["entry_first"],
-            r["entry_last"],
-        ])
-    csv_bytes = buf.getvalue().encode("utf-8")
-    from flask import Response
-    return Response(
-        csv_bytes,
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=audit_votes.csv"}
+    writer.writerow(
+        ["vote_id", "voter_first", "voter_last", "voted_at", "category", "costume_name", "entry_first", "entry_last"]
     )
+    for r in rows:
+        writer.writerow(
+            [
+                r["vote_id"],
+                r["voter_first"],
+                r["voter_last"],
+                r["voted_at"],
+                r["category_name"],
+                r["costume_name"],
+                r["entry_first"],
+                r["entry_last"],
+            ]
+        )
+    csv_bytes = buf.getvalue().encode("utf-8")
+    return Response(
+        csv_bytes, mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=audit_votes.csv"}
+    )
+
+
+# ------------------------------ STATS CORE ------------------------
+
+
+def _human_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    x = float(n)
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024.0
+        i += 1
+    return f"{x:.1f} {units[i]}"
+
+
+def _dir_size(path: Path) -> int:
+    try:
+        return sum(p.stat().st_size for p in path.glob("**/*") if p.is_file())
+    except Exception:
+        return 0
+
+
+def stats_gather():
+    """Compute stats without side-effects. Returns a dict safe to JSON-serialize."""
+    now = dt.datetime.utcnow()
+    with get_db() as conn:
+        # Core counts
+        total_entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        total_votes = conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        last_vote_row = conn.execute(
+            "SELECT created_at FROM votes ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        last_vote_at = last_vote_row["created_at"] if last_vote_row else None
+
+        enabled_cats = conn.execute(
+            "SELECT id, name FROM categories WHERE enabled=1 ORDER BY name"
+        ).fetchall()
+        disabled_cats = conn.execute(
+            "SELECT id, name FROM categories WHERE enabled=0 ORDER BY name"
+        ).fetchall()
+
+        # Per-category participation and leaders
+        per_category = []
+        for c in conn.execute("SELECT id, name FROM categories ORDER BY name").fetchall():
+            part = conn.execute(
+                "SELECT COUNT(*) FROM vote_items WHERE category_id=?", (c["id"],)
+            ).fetchone()[0]
+
+            leaders = conn.execute(
+                """
+                SELECT e.costume_name AS name, e.first_name AS first, e.last_name AS last,
+                       COUNT(vi.id) AS votes
+                FROM entries e
+                LEFT JOIN vote_items vi ON vi.entry_id = e.id AND vi.category_id = ?
+                GROUP BY e.id
+                ORDER BY votes DESC, e.costume_name ASC
+                LIMIT 2
+                """,
+                (c["id"],),
+            ).fetchall()
+            leader = None
+            margin = None
+            if leaders:
+                top = leaders[0]
+                leader = {
+                    "costume_name": top["name"],
+                    "by": f'{top["first"]} {top["last"]}',
+                    "votes": top["votes"],
+                }
+                if len(leaders) > 1:
+                    margin = top["votes"] - leaders[1]["votes"]
+
+            per_category.append(
+                {
+                    "id": c["id"],
+                    "name": c["name"],
+                    "participation": part,
+                    "leader": leader,
+                    "lead_margin": margin,
+                }
+            )
+
+        # Timeline: hourly buckets (UTC)
+        entries_by_hour = conn.execute(
+            """
+            SELECT substr(created_at, 1, 13) AS hour, COUNT(*) AS count
+            FROM entries
+            GROUP BY hour
+            ORDER BY hour
+            """
+        ).fetchall()
+        votes_by_hour = conn.execute(
+            """
+            SELECT substr(created_at, 1, 13) AS hour, COUNT(*) AS count
+            FROM votes
+            GROUP BY hour
+            ORDER BY hour
+            """
+        ).fetchall()
+
+        # Photo stats
+        photos = conn.execute(
+            "SELECT photo_path FROM entries WHERE photo_path IS NOT NULL AND photo_path <> ''"
+        ).fetchall()
+        photo_files = [UPLOAD_DIR / r["photo_path"] for r in photos if r["photo_path"]]
+        sizes = []
+        for p in photo_files:
+            try:
+                sizes.append(p.stat().st_size)
+            except Exception:
+                pass
+        photos_with = len(photo_files)
+        avg_photo_size = sum(sizes) / len(sizes) if sizes else 0
+
+    # Storage info
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    uploads_size = _dir_size(UPLOAD_DIR)
+
+    # Uptime
+    uptime = (now - APP_START_TS).total_seconds()
+
+    # Progress
+    progress = None
+    if EXPECTED_ATTENDEES > 0:
+        progress = min(100, round(total_votes / EXPECTED_ATTENDEES * 100, 1))
+
+    return {
+        "now_utc": now.isoformat(timespec="seconds"),
+        "voting_enabled": get_setting("voting_enabled", "0") == "1",
+        "expected_attendees": EXPECTED_ATTENDEES,
+        "progress_pct": progress,
+        "counts": {
+            "entries": total_entries,
+            "votes": total_votes,
+            "categories_enabled": len(enabled_cats),
+            "categories_disabled": len(disabled_cats),
+        },
+        "last_vote_at": last_vote_at,
+        "per_category": per_category,
+        "timeline": {
+            "entries_hourly": [{"hour": r["hour"], "count": r["count"]} for r in entries_by_hour],
+            "votes_hourly": [{"hour": r["hour"], "count": r["count"]} for r in votes_by_hour],
+        },
+        "storage": {
+            "db_size_bytes": db_size,
+            "db_size_human": _human_bytes(db_size),
+            "uploads_size_bytes": uploads_size,
+            "uploads_size_human": _human_bytes(uploads_size),
+            "avg_photo_size_bytes": int(avg_photo_size),
+            "avg_photo_size_human": _human_bytes(int(avg_photo_size)),
+            "photos_with": photos_with,
+        },
+        "uptime_seconds": int(uptime),
+    }
+
+
+# ------------------------------ PURGE -----------------------------
+
 
 @app.post("/admin/purge")
 def admin_purge():
     """Danger zone: wipe all entries, votes, and categories; reset settings; delete uploaded photos; reseed defaults."""
     require_admin()
 
-    # delete uploaded images
+    # Delete uploaded images
     try:
         for p in UPLOAD_DIR.iterdir():
             if p.is_file():
@@ -719,23 +876,22 @@ def admin_purge():
     except Exception:
         pass
 
-    # clear tables in safe order
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM vote_items;")
-    cur.execute("DELETE FROM votes;")
-    cur.execute("DELETE FROM entries;")
-    cur.execute("DELETE FROM categories;")
-    cur.execute("DELETE FROM settings;")
-    conn.commit()
-    conn.close()
+    # Clear tables in safe order
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM vote_items;")
+        cur.execute("DELETE FROM votes;")
+        cur.execute("DELETE FROM entries;")
+        cur.execute("DELETE FROM categories;")
+        cur.execute("DELETE FROM settings;")
 
-    # reseed
+    # Reseed
     init_db()
     flash("All data purged. Defaults re-seeded and uploads cleared.", "success")
-    return redirect(url_for("admin"))
+    return to_admin()
 
-# ---------------------------- TEMPLATES ----------------------------
+
+# ---------------------------- TEMPLATES ---------------------------
 
 TPL_BASE = r"""
 <!doctype html>
@@ -766,7 +922,7 @@ TPL_BASE = r"""
       border:1px solid #2b2f3a;
       background:#0f1115;
       color:var(--ink);
-      box-sizing:border-box; /* prevent crowding */
+      box-sizing:border-box;
     }
     label{font-size:.9rem;color:var(--muted)}
     .muted{color:var(--muted)}
@@ -780,6 +936,14 @@ TPL_BASE = r"""
     .flash.success{background:#1c3b24;color:#c7f7d1}
     .flash.error{background:#3b1c1c;color:#f7c7c7}
     footer{opacity:.7;margin-top:28px;font-size:.9rem}
+
+    /* Shared utility classes */
+    .progress{height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px}
+    .progress > div{height:100%;background:var(--accent)}
+    .notice-box{margin:12px 0 18px 0;padding:12px 14px;background:#1b1e25;border:1px solid #2b2f3a;border-radius:12px}
+    .category-section{margin:1.0em 0;padding:1em;background:#222;border-radius:12px}
+    .entries-grid{display:grid;gap:16px;grid-template-columns:repeat(2,minmax(0,1fr))}
+    @media (min-width:1024px){ .entries-grid{grid-template-columns:repeat(3,minmax(0,1fr))} }
   </style>
 </head>
 <body>
@@ -790,6 +954,7 @@ TPL_BASE = r"""
         <a href="{{ url_for('home') }}">Home</a>
         <a href="{{ url_for('entry_form') }}">Submit Costume</a>
         <a href="{{ url_for('vote_form') }}">Vote</a>
+        <a href="{{ url_for('public_stats') }}">Stats</a>
         <a href="{{ url_for('admin') }}">Admin</a>
       </nav>
     </header>
@@ -819,6 +984,7 @@ TPL_HOME = r"""
   <span class="badge">Voting status: <strong>{{ 'OPEN' if voting_enabled else 'CLOSED' }}</strong></span>
   <a class="btn" href="{{ url_for('entry_form') }}">Submit Costume</a>
   <a class="btn secondary" href="{{ url_for('vote_form') }}">Go to Voting</a>
+  <a class="btn" href="{{ url_for('public_stats') }}">Stats for Nerds</a>
 </div>
 """
 
@@ -853,14 +1019,13 @@ TPL_VOTE_NAME = r"""
 
 <div style="margin: 12px 0;">
   <div class="muted">Step {{ step }} of {{ total }}</div>
-  <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px;">
-    <div style="height:100%;width:{{ (step / total * 100)|round(0,'floor') }}%;background:var(--accent);"></div>
-  </div>
+  {% set pct = (step / total * 100)|round(0, 'floor') %}
+  <div class="progress"><div style="width:{{ pct }}%"></div></div>
 </div>
 
-<!-- Instructions box: edit this text as you like -->
-<div class="notice-box" style="margin:12px 0 18px 0; padding:12px 14px; background:#1b1e25; border:1px solid #2b2f3a; border-radius:12px;">
-  <strong>Instructions:</strong> Enter your name to begin. On the next pages, pick one costume per category. You can go back to change selections before submitting.
+<div class="notice-box">
+  <strong>Instructions:</strong> Enter your name to begin. On the next pages, pick one costume per category.
+  You can go back to change selections before submitting.
 </div>
 
 <style>
@@ -892,21 +1057,15 @@ TPL_VOTE_WIZARD = r"""
 
 <div style="margin: 12px 0;">
   <div class="muted">Category {{ step - 1 }} of {{ total - 1 }}</div>
-  <div style="height:10px;background:#222;border-radius:999px;overflow:hidden;margin-top:6px;">
-    <div style="height:100%;width:{{ (step / total * 100)|round(0,'floor') }}%;background:var(--accent);"></div>
-  </div>
+  {% set pct = (step / total * 100)|round(0, 'floor') %}
+  <div class="progress"><div style="width:{{ pct }}%"></div></div>
 </div>
 
 <form action="{{ url_for('vote_step_post', idx=idx) }}" method="post">
-  <div class="category-section" style="margin:1.0em 0; padding:1em; background:#222; border-radius:12px;">
+  <div class="category-section">
     <h2 style="font-size:1.2em; color:#ffd700; border-bottom:1px solid #555; padding-bottom:0.3em; margin-top:0;">
       {{ category.name }}
     </h2>
-
-    <style>
-      .entries-grid {display:grid; gap:16px; grid-template-columns:repeat(2,minmax(0,1fr));}
-      @media (min-width:1024px) {.entries-grid {grid-template-columns:repeat(3,minmax(0,1fr));}}
-    </style>
     <div class="entries-grid">
       {% for e in entries %}
         <label class="card" style="cursor:pointer">
@@ -956,6 +1115,7 @@ TPL_ADMIN_DASH = r"""
   </form>
   <a class="btn secondary" href="{{ url_for('admin_results') }}">View Results</a>
   <a class="btn" href="{{ url_for('admin_audit') }}">Audit: Who Voted</a>
+  <a class="btn" href="{{ url_for('public_stats') }}">Stats</a>
   <form action="{{ url_for('admin_purge') }}" method="post" onsubmit="return confirm('Purge ALL data (entries, votes, categories) and delete uploaded photos? This cannot be undone.');">
     <button class="btn danger" type="submit">Purge All Data</button>
   </form>
@@ -1080,6 +1240,115 @@ TPL_ADMIN_AUDIT = r"""
     {% endif %}
   {% endfor %}
 {% endif %}
+"""
+
+# Reuse this template for public /stats
+TPL_ADMIN_STATS = r"""
+<h3>Stats for Nerds</h3>
+<div class="row mb-4">
+  <a class="btn" href="{{ url_for('public_stats_json') }}">View JSON</a>
+</div>
+
+<div class="grid cols-3 mb-6">
+  <div class="card">
+    <strong>Overview</strong>
+    <div class="muted">Now (UTC)</div>
+    <div class="mb-2">{{ d.now_utc }}</div>
+
+    <div class="muted">Voting</div>
+    <div class="mb-2"><span class="badge">{{ 'ENABLED' if d.voting_enabled else 'DISABLED' }}</span></div>
+
+    <div class="muted">Expected Attendees</div>
+    <div class="mb-2">{{ d.expected_attendees or 'Unknown' }}</div>
+
+    <div class="muted">Progress</div>
+    <div class="mb-2">
+      {% if d.progress_pct is not none %}
+        <span class="badge">{{ d.progress_pct }}%</span>
+      {% else %}
+        <span class="badge">n/a</span>
+      {% endif %}
+    </div>
+
+    <div class="muted">Uptime</div>
+    <div>{{ (d.uptime_seconds // 3600) }}h {{ (d.uptime_seconds // 60) % 60 }}m</div>
+  </div>
+
+  <div class="card">
+    <strong>Counts</strong>
+    <div class="row"><div class="muted">Entries</div><div class="badge">{{ d.counts.entries }}</div></div>
+    <div class="row"><div class="muted">Votes</div><div class="badge">{{ d.counts.votes }}</div></div>
+    <div class="row"><div class="muted">Categories (enabled)</div><div class="badge">{{ d.counts.categories_enabled }}</div></div>
+    <div class="row"><div class="muted">Categories (disabled)</div><div class="badge">{{ d.counts.categories_disabled }}</div></div>
+    <div class="muted" style="margin-top:10px;">Last ballot</div>
+    <div>{{ d.last_vote_at or 'No ballots yet' }}</div>
+  </div>
+
+  <div class="card">
+    <strong>Storage</strong>
+    <div class="row"><div class="muted">DB size</div><div class="badge">{{ d.storage.db_size_human }}</div></div>
+    <div class="row"><div class="muted">Uploads size</div><div class="badge">{{ d.storage.uploads_size_human }}</div></div>
+    <div class="row"><div class="muted">Photos (count)</div><div class="badge">{{ d.storage.photos_with }}</div></div>
+    <div class="row"><div class="muted">Avg photo size</div><div class="badge">{{ d.storage.avg_photo_size_human }}</div></div>
+  </div>
+</div>
+
+<h4>Per-Category</h4>
+<div class="grid cols-3 mb-6">
+  {% for c in d.per_category %}
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <strong>{{ c.name }}</strong>
+        <span class="badge">Ballots: {{ c.participation }}</span>
+      </div>
+      {% if c.leader %}
+        <div class="muted" style="margin-top:6px;">Leader</div>
+        <div><strong>{{ c.leader.costume_name }}</strong> <span class="muted">by {{ c.leader.by }}</span></div>
+        <div class="row"><div class="muted">Votes</div><div class="badge">{{ c.leader.votes }}</div></div>
+        {% if c.lead_margin is not none %}
+          <div class="row"><div class="muted">Lead margin</div><div class="badge">{{ c.lead_margin }}</div></div>
+        {% endif %}
+      {% else %}
+        <div class="muted">No entries.</div>
+      {% endif %}
+    </div>
+  {% endfor %}
+</div>
+
+<h4>Timeline (UTC)</h4>
+<div class="grid cols-2">
+  <div class="card">
+    <strong>Entries per hour</strong>
+    {% if not d.timeline.entries_hourly %}
+      <div class="muted">No data</div>
+    {% else %}
+      <div>
+        {% for r in d.timeline.entries_hourly %}
+          <div class="row" style="justify-content:space-between;border-bottom:1px solid #262a34;padding:6px 0;">
+            <div class="muted">{{ r.hour }}:00</div>
+            <div class="badge">{{ r.count }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <strong>Votes per hour</strong>
+    {% if not d.timeline.votes_hourly %}
+      <div class="muted">No data</div>
+    {% else %}
+      <div>
+        {% for r in d.timeline.votes_hourly %}
+          <div class="row" style="justify-content:space-between;border-bottom:1px solid #262a34;padding:6px 0;">
+            <div class="muted">{{ r.hour }}:00</div>
+            <div class="badge">{{ r.count }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+</div>
 """
 
 if __name__ == "__main__":
