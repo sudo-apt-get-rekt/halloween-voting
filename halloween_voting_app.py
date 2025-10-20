@@ -8,6 +8,7 @@ Features
 - Admin dashboard: view/delete entries, enable/disable voting, manage categories (add/rename/delete)
 - Voting wizard: name-only first page (/vote/name), then one category per screen with Back/Next/Finish
 - Results tally (admin-only)
+- Audit view (admin): see who voted for what + CSV export
 - Duplicate-vote protection by unique voter full name (case-insensitive)
 - One-click purge: wipe all data and reseed defaults
 
@@ -123,6 +124,12 @@ def init_db():
         );
         """
     )
+
+    # optional indexes for faster admin queries
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_votes_name ON votes(LOWER(voter_first), LOWER(voter_last));")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_vote ON vote_items(vote_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_cat ON vote_items(category_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_vote_items_entry ON vote_items(entry_id);")
 
     # seed categories if empty
     cur.execute("SELECT COUNT(*) FROM categories")
@@ -383,7 +390,6 @@ def vote_step_post(idx: int):
 
     nav = request.form.get("nav", "next")
     if nav == "prev":
-        # Back from first category returns to the name page
         return redirect(url_for("vote_step", idx=idx - 1)) if idx > 0 else redirect(url_for("vote_name"))
     elif nav == "next":
         return redirect(url_for("vote_step", idx=min(len(cats) - 1, idx + 1)))
@@ -616,6 +622,87 @@ def admin_results():
         },
     )
 
+# --- Admin Audit (who voted for what) ---
+@app.get("/admin/audit")
+def admin_audit():
+    require_admin()
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT
+          v.id            AS vote_id,
+          v.voter_first   AS voter_first,
+          v.voter_last    AS voter_last,
+          v.created_at    AS voted_at,
+          c.name          AS category_name,
+          e.costume_name  AS costume_name,
+          e.first_name    AS entry_first,
+          e.last_name     AS entry_last
+        FROM votes v
+        JOIN vote_items vi ON vi.vote_id = v.id
+        JOIN categories c  ON c.id = vi.category_id
+        JOIN entries e     ON e.id = vi.entry_id
+        ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
+        """
+    ).fetchall()
+    conn.close()
+
+    return render_template_string(
+        TPL_BASE,
+        **{
+            "page_title": "Audit — Who Voted For What",
+            "content": render_template_string(TPL_ADMIN_AUDIT, rows=rows),
+        },
+    )
+
+@app.get("/admin/audit.csv")
+def admin_audit_csv():
+    require_admin()
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT
+          v.id            AS vote_id,
+          v.voter_first   AS voter_first,
+          v.voter_last    AS voter_last,
+          v.created_at    AS voted_at,
+          c.name          AS category_name,
+          e.costume_name  AS costume_name,
+          e.first_name    AS entry_first,
+          e.last_name     AS entry_last
+        FROM votes v
+        JOIN vote_items vi ON vi.vote_id = v.id
+        JOIN categories c  ON c.id = vi.category_id
+        JOIN entries e     ON e.id = vi.entry_id
+        ORDER BY v.created_at DESC, c.name ASC, e.costume_name ASC
+        """
+    ).fetchall()
+    conn.close()
+
+    # Build CSV
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["vote_id", "voter_first", "voter_last", "voted_at", "category", "costume_name", "entry_first", "entry_last"])
+    for r in rows:
+        writer.writerow([
+            r["vote_id"],
+            r["voter_first"],
+            r["voter_last"],
+            r["voted_at"],
+            r["category_name"],
+            r["costume_name"],
+            r["entry_first"],
+            r["entry_last"],
+        ])
+    csv_bytes = buf.getvalue().encode("utf-8")
+    from flask import Response
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=audit_votes.csv"}
+    )
+
 @app.post("/admin/purge")
 def admin_purge():
     """Danger zone: wipe all entries, votes, and categories; reset settings; delete uploaded photos; reseed defaults."""
@@ -679,7 +766,7 @@ TPL_BASE = r"""
       border:1px solid #2b2f3a;
       background:#0f1115;
       color:var(--ink);
-      box-sizing:border-box;
+      box-sizing:border-box; /* prevent crowding */
     }
     label{font-size:.9rem;color:var(--muted)}
     .muted{color:var(--muted)}
@@ -760,7 +847,7 @@ TPL_ENTRY_FORM = r"""
 </form>
 """
 
-# Name-only first page
+# Name-only first page (with inline instructions box)
 TPL_VOTE_NAME = r"""
 <h3>Cast Your Votes</h3>
 
@@ -773,7 +860,7 @@ TPL_VOTE_NAME = r"""
 
 <!-- Instructions box: edit this text as you like -->
 <div class="notice-box" style="margin:12px 0 18px 0; padding:12px 14px; background:#1b1e25; border:1px solid #2b2f3a; border-radius:12px;">
-  <strong>Instructions:</strong> Enter your name to begin. On the next pages, pick one costume per category and then select 'Next'. You can go back to change selections before submitting.
+  <strong>Instructions:</strong> Enter your name to begin. On the next pages, pick one costume per category. You can go back to change selections before submitting.
 </div>
 
 <style>
@@ -868,6 +955,7 @@ TPL_ADMIN_DASH = r"""
     <button class="btn secondary" type="submit">Log Out</button>
   </form>
   <a class="btn secondary" href="{{ url_for('admin_results') }}">View Results</a>
+  <a class="btn" href="{{ url_for('admin_audit') }}">Audit: Who Voted</a>
   <form action="{{ url_for('admin_purge') }}" method="post" onsubmit="return confirm('Purge ALL data (entries, votes, categories) and delete uploaded photos? This cannot be undone.');">
     <button class="btn danger" type="submit">Purge All Data</button>
   </form>
@@ -949,6 +1037,49 @@ TPL_RESULTS = r"""
     {% endif %}
   </div>
 {% endfor %}
+"""
+
+TPL_ADMIN_AUDIT = r"""
+<h3>Audit — Who Voted For What</h3>
+<div class="row mb-4">
+  <a class="btn secondary" href="{{ url_for('admin') }}">← Back to Admin</a>
+  <a class="btn" href="{{ url_for('admin_audit_csv') }}">Download CSV</a>
+</div>
+
+{% if not rows %}
+  <p class="muted">No ballots have been submitted yet.</p>
+{% else %}
+  {% set current_vote = None %}
+  {% for r in rows %}
+    {% if current_vote != r.vote_id %}
+      {% if not loop.first %}
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="card mb-3">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <div><strong>Voter:</strong> {{ r.voter_first }} {{ r.voter_last }}</div>
+          <div class="muted">Ballot ID {{ r.vote_id }} • {{ r.voted_at }}</div>
+        </div>
+        <div style="margin-top:10px;">
+      {% set current_vote = r.vote_id %}
+    {% endif %}
+
+    <div class="row" style="justify-content:space-between; align-items:center; border-bottom:1px solid #262a34; padding:8px 0;">
+      <div class="muted">{{ r.category_name }}</div>
+      <div>
+        <strong>{{ r.costume_name }}</strong>
+        <span class="muted">by {{ r.entry_first }} {{ r.entry_last }}</span>
+      </div>
+    </div>
+
+    {% if loop.last %}
+        </div>
+      </div>
+    {% endif %}
+  {% endfor %}
+{% endif %}
 """
 
 if __name__ == "__main__":
